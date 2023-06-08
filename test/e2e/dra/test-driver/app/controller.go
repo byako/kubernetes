@@ -152,11 +152,20 @@ func (c *ExampleController) readParametersFromConfigMap(ctx context.Context, nam
 	return configMap.Data, nil
 }
 
-func (c *ExampleController) Allocate(ctx context.Context, claim *resourcev1alpha2.ResourceClaim, claimParameters interface{}, class *resourcev1alpha2.ResourceClass, classParameters interface{}, selectedNode string) (result *resourcev1alpha2.AllocationResult, err error) {
-	if c.resources.AllocateWrapper != nil {
-		return c.resources.AllocateWrapper(ctx, claim, claimParameters, class, classParameters, selectedNode, c.allocate)
+func (c *ExampleController) Allocate(ctx context.Context, claimAllocations []*controller.ClaimAllocation, selectedNode string) (allocationResults []*resourcev1alpha2.AllocationResult, err error) {
+	var allocationResult *resourcev1alpha2.AllocationResult
+	for _, ca := range claimAllocations {
+		if c.resources.AllocateWrapper != nil {
+			allocationResult, err = c.resources.AllocateWrapper(ctx, ca.Claim, ca.ClaimParameters, ca.Class, ca.ClassParameters, selectedNode, c.allocate)
+		} else {
+			allocationResult, err = c.allocate(ctx, ca.Claim, ca.ClaimParameters, ca.Class, ca.ClassParameters, selectedNode)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed allocating claim %v", ca.Claim.UID)
+		}
+		allocationResults = append(allocationResults, allocationResult)
 	}
-	return c.allocate(ctx, claim, claimParameters, class, classParameters, selectedNode)
+	return allocationResults, nil
 }
 
 // allocate simply copies parameters as JSON map into a ResourceHandle.
