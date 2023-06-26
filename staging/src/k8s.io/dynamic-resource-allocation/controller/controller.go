@@ -535,6 +535,7 @@ func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocati
 			// allocation attempts (first one wins) or when we see the
 			// update of the PodSchedulingContext object.
 			logger.V(5).Info("Claim is already allocated, skipping allocation", "claim", claim.PodClaimName)
+			continue
 		}
 		needAllocation = append(needAllocation, claim)
 	}
@@ -545,17 +546,25 @@ func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocati
 	}
 
 	for _, claimAllocation := range needAllocation {
-		claim := claimAllocation.Claim
-		if !ctrl.hasFinalizer(claim) {
-			// Set finalizer before doing anything. We continue with the updated claim.
-			logger.V(5).Info("Adding finalizer", "claim", claim.UID)
-			claim.Finalizers = append(claim.Finalizers, ctrl.finalizer)
-			var err error
-			claim, err = ctrl.kubeClient.ResourceV1alpha2().ResourceClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{})
-			if err != nil {
-				return fmt.Errorf("add finalizer: %v", err)
+		if !ctrl.hasFinalizer(claimAllocation.Claim) {
+			patchFn := func() error {
+				claim := claimAllocation.Claim.DeepCopy()
+				// Set finalizer before doing anything. We continue with the updated claim.
+				logger.V(5).Info("Adding finalizer", "claim", claim.Name)
+				claim.Finalizers = append(claim.Finalizers, ctrl.finalizer)
+				var err error
+				claim, err = ctrl.kubeClient.ResourceV1alpha2().ResourceClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{})
+				if err != nil {
+					return fmt.Errorf("add finalizer: %v", err)
+				}
+				ctrl.claimCache.Mutation(claim)
+				claimAllocation.Claim = claim
+				return nil
 			}
-			ctrl.claimCache.Mutation(claim)
+			err := retry.RetryOnConflict(retry.DefaultRetry, patchFn)
+			if err != nil {
+				return err
+			}
 		}
 	}
 
@@ -573,17 +582,17 @@ func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocati
 	// Update claims' status with allocation info
 	for caIdx, allocation := range allocations {
 		patchFn := func() error {
-			oldClaim := claims[caIdx].Claim
-			claim, err := ctrl.getCachedClaim(ctx, oldClaim.Namespace+"/"+oldClaim.Name)
+			claim := claims[caIdx].Claim
 			if err != nil {
 				return fmt.Errorf("update claim status with allocation info: %v", err)
 			}
+			claim = claim.DeepCopy()
 			claim.Status.Allocation = allocation
 			claim.Status.DriverName = ctrl.name
 			if selectedUser != nil {
 				claim.Status.ReservedFor = append(claim.Status.ReservedFor, *selectedUser)
 			}
-			logger.V(6).Info("Updating claim after allocation", "claim", claim)
+			logger.V(5).Info("Updating claim after allocation", "claim", claim)
 			claim, err = ctrl.kubeClient.ResourceV1alpha2().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claim, metav1.UpdateOptions{})
 			if err != nil {
 				return err
