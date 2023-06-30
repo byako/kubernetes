@@ -40,7 +40,6 @@ import (
 	resourcev1alpha2listers "k8s.io/client-go/listers/resource/v1alpha2"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
-	"k8s.io/client-go/util/retry"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/dynamic-resource-allocation/resourceclaim"
 	"k8s.io/klog/v2"
@@ -86,7 +85,7 @@ type Driver interface {
 	//
 	// The objects are read-only and must not be modified. This call
 	// must be idempotent.
-	Allocate(ctx context.Context, claims []*ClaimAllocation, selectedNode string) ([]*resourcev1alpha2.AllocationResult, error)
+	Allocate(ctx context.Context, claims []*ClaimAllocation, selectedNode string)
 
 	// Deallocate gets called when a ResourceClaim is ready to be
 	// freed.
@@ -126,6 +125,11 @@ type ClaimAllocation struct {
 	// UnsuitableNodes needs to be filled in by the driver when
 	// Driver.UnsuitableNodes gets called.
 	UnsuitableNodes []string
+
+	// Claim-specific error message
+	Error error
+	// Decision made by driver about which resources were allocated for the claim
+	Allocation *resourcev1alpha2.AllocationResult
 }
 
 type controller struct {
@@ -368,7 +372,7 @@ func (ctrl *controller) syncKey(ctx context.Context, key string) (obj runtime.Ob
 	case claimKeyPrefix:
 		claim, err := ctrl.getCachedClaim(ctx, object)
 		if claim == nil || err != nil {
-			return nil, err
+			return nil, fmt.Errorf("cached claim not found, err: %v", err)
 		}
 		obj, finalErr = claim, ctrl.syncClaim(ctx, claim)
 	case schedulingCtxKeyPrefix:
@@ -508,7 +512,9 @@ func (ctrl *controller) syncClaim(ctx context.Context, claim *resourcev1alpha2.R
 		ClassParameters: classParameters,
 	}}
 
-	return ctrl.allocateClaims(ctx, claimAllocations, "", nil)
+	ctrl.allocateClaims(ctx, claimAllocations, "", nil)
+
+	return claimAllocations[0].Error
 }
 
 func (ctrl *controller) getParameters(ctx context.Context, claim *resourcev1alpha2.ResourceClaim, class *resourcev1alpha2.ResourceClass) (claimParameters, classParameters interface{}, err error) {
@@ -525,7 +531,9 @@ func (ctrl *controller) getParameters(ctx context.Context, claim *resourcev1alph
 	return
 }
 
-func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocations, selectedNode string, selectedUser *resourcev1alpha2.ResourceClaimConsumerReference) error {
+// allocateClaims filters list of claims, keeps those needeing allocation and asks driver to do the allocations.
+// Driver is supposed to write the AllocationResult and Error field into argument claims slice.
+func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocations, selectedNode string, selectedUser *resourcev1alpha2.ResourceClaimConsumerReference) {
 	logger := klog.FromContext(ctx)
 
 	var needAllocation claimAllocations
@@ -542,71 +550,66 @@ func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocati
 
 	if len(needAllocation) == 0 {
 		logger.V(5).Info("No claims need allocation, nothing to do")
-		return nil
+		return
 	}
 
+	// Keep separately claims that succeeded adding finalizers,
+	// they will be sent for Allocate to the driver.
+	claimsWithFinalizers := claimAllocations{}
 	for _, claimAllocation := range needAllocation {
 		if !ctrl.hasFinalizer(claimAllocation.Claim) {
-			patchFn := func() error {
-				claim := claimAllocation.Claim.DeepCopy()
-				// Set finalizer before doing anything. We continue with the updated claim.
-				logger.V(5).Info("Adding finalizer", "claim", claim.Name)
-				claim.Finalizers = append(claim.Finalizers, ctrl.finalizer)
-				var err error
-				claim, err = ctrl.kubeClient.ResourceV1alpha2().ResourceClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{})
-				if err != nil {
-					return fmt.Errorf("add finalizer: %v", err)
-				}
-				ctrl.claimCache.Mutation(claim)
-				claimAllocation.Claim = claim
-				return nil
-			}
-			err := retry.RetryOnConflict(retry.DefaultRetry, patchFn)
+			claim := claimAllocation.Claim.DeepCopy()
+			// Set finalizer before doing anything. We continue with the updated claim.
+			logger.V(5).Info("Adding finalizer", "claim", claim.Name)
+			claim.Finalizers = append(claim.Finalizers, ctrl.finalizer)
+			var err error
+			claim, err = ctrl.kubeClient.ResourceV1alpha2().ResourceClaims(claim.Namespace).Update(ctx, claim, metav1.UpdateOptions{})
 			if err != nil {
-				return err
-			}
-		}
-	}
-
-	logger.V(5).Info("Allocating")
-	allocations, err := ctrl.driver.Allocate(ctx, claims, selectedNode)
-	if err != nil {
-		return fmt.Errorf("allocate: %v", err)
-	}
-
-	if len(claims) != len(allocations) {
-		logger.Error(nil, "resource driver returned less allocation results than resource claims were requested")
-		return fmt.Errorf("allocationResults are fewer than resourceClaims")
-	}
-
-	// Update claims' status with allocation info
-	for caIdx, allocation := range allocations {
-		patchFn := func() error {
-			claim := claims[caIdx].Claim
-			if err != nil {
-				return fmt.Errorf("update claim status with allocation info: %v", err)
-			}
-			claim = claim.DeepCopy()
-			claim.Status.Allocation = allocation
-			claim.Status.DriverName = ctrl.name
-			if selectedUser != nil {
-				claim.Status.ReservedFor = append(claim.Status.ReservedFor, *selectedUser)
-			}
-			logger.V(5).Info("Updating claim after allocation", "claim", claim)
-			claim, err = ctrl.kubeClient.ResourceV1alpha2().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claim, metav1.UpdateOptions{})
-			if err != nil {
-				return err
+				logger.Error(err, "add finalizer", "claim", claim.Name)
+				claimAllocation.Error = fmt.Errorf("add finalizer: %v", err)
+				// do not save claim to ask for Allocate from Driver
+				continue
 			}
 			ctrl.claimCache.Mutation(claim)
-			return nil
+			claimAllocation.Claim = claim
+		}
+		claimsWithFinalizers = append(claimsWithFinalizers, claimAllocation)
+	}
+
+	// Beyong here we only operate with claimsWithFinalizers
+
+	logger.V(5).Info("Allocating")
+	ctrl.driver.Allocate(ctx, claimsWithFinalizers, selectedNode)
+
+	// Update successfully allocated claims' status with allocation info
+	for _, claimAllocation := range claimsWithFinalizers {
+		if claimAllocation.Error != nil {
+			logger.Error(claimAllocation.Error, "allocating claim", "claim", claimAllocation.Claim.Name)
+			continue
+		}
+		if claimAllocation.Allocation == nil {
+			logger.Error(nil, "allocating claim: missing allocation from driver", "claim", claimAllocation.Claim.Name)
+			claimAllocation.Error = fmt.Errorf("allocating claim: missing allocation from driver")
+			// do now update this claim with allocation, it might succeed next time
+			continue
+		}
+		logger.V(5).Info("successfully allocated", "claim", claimAllocation.Claim.Name)
+		claim := claimAllocation.Claim.DeepCopy()
+		claim.Status.Allocation = claimAllocation.Allocation
+		claim.Status.DriverName = ctrl.name
+		if selectedUser != nil {
+			claim.Status.ReservedFor = append(claim.Status.ReservedFor, *selectedUser)
+		}
+		logger.V(5).Info("Updating claim after allocation", "claim", claim)
+		claim, err := ctrl.kubeClient.ResourceV1alpha2().ResourceClaims(claim.Namespace).UpdateStatus(ctx, claim, metav1.UpdateOptions{})
+		if err != nil {
+			claimAllocation.Error = fmt.Errorf("add allocation: %v", err)
+			continue
 		}
 
-		err = retry.RetryOnConflict(retry.DefaultRetry, patchFn)
-		if err != nil {
-			return fmt.Errorf("add allocation: %v, claim: %v", err, claims[caIdx].Claim.UID)
-		}
+		ctrl.claimCache.Mutation(claim)
 	}
-	return nil
+	return
 }
 
 func (ctrl *controller) checkPodClaim(ctx context.Context, pod *v1.Pod, podClaim v1.PodResourceClaim) (*ClaimAllocation, error) {
@@ -736,8 +739,16 @@ func (ctrl *controller) syncPodSchedulingContexts(ctx context.Context, schedulin
 				UID:      pod.UID,
 			}
 
-			if err := ctrl.allocateClaims(ctx, claims, selectedNode, selectedUser); err != nil {
-				return fmt.Errorf("allocation of pod claims failed: %v", err)
+			ctrl.allocateClaims(ctx, claims, selectedNode, selectedUser)
+
+			allocationFailed := false
+			for _, delayed := range claims {
+				if delayed.Error != nil {
+					allocationFailed = true
+				}
+			}
+			if allocationFailed {
+				return fmt.Errorf("allocation of one or more pod claims failed")
 			}
 		}
 	}
@@ -746,42 +757,29 @@ func (ctrl *controller) syncPodSchedulingContexts(ctx context.Context, schedulin
 	// we managed to allocate because we might have to undo that.
 	// TODO: replace with patching the array. We can do that without race conditions
 	// because each driver is responsible for its own entries.
-	retryFn := func() error {
-		modified := false
-		latestSchedulingCtx, err := ctrl.schedulingCtxLister.PodSchedulingContexts(schedulingCtx.Namespace).Get(schedulingCtx.Name)
-		if err != nil {
-			return fmt.Errorf("could not get scheduling context %v/%v", schedulingCtx.Namespace, schedulingCtx.Name)
+	modified := false
+	schedulingCtx = schedulingCtx.DeepCopy()
+	for _, delayed := range claims {
+		i := findClaim(schedulingCtx.Status.ResourceClaims, delayed.PodClaimName)
+		if i < 0 {
+			// Add new entry.
+			schedulingCtx.Status.ResourceClaims = append(schedulingCtx.Status.ResourceClaims,
+				resourcev1alpha2.ResourceClaimSchedulingStatus{
+					Name:            delayed.PodClaimName,
+					UnsuitableNodes: delayed.UnsuitableNodes,
+				})
+			modified = true
+		} else if stringsDiffer(schedulingCtx.Status.ResourceClaims[i].UnsuitableNodes, delayed.UnsuitableNodes) {
+			// Update existing entry.
+			schedulingCtx.Status.ResourceClaims[i].UnsuitableNodes = delayed.UnsuitableNodes
+			modified = true
 		}
-
-		schedulingCtx = latestSchedulingCtx.DeepCopy()
-		for _, delayed := range claims {
-			i := findClaim(schedulingCtx.Status.ResourceClaims, delayed.PodClaimName)
-			if i < 0 {
-				// Add new entry.
-				schedulingCtx.Status.ResourceClaims = append(schedulingCtx.Status.ResourceClaims,
-					resourcev1alpha2.ResourceClaimSchedulingStatus{
-						Name:            delayed.PodClaimName,
-						UnsuitableNodes: delayed.UnsuitableNodes,
-					})
-				modified = true
-			} else if stringsDiffer(schedulingCtx.Status.ResourceClaims[i].UnsuitableNodes, delayed.UnsuitableNodes) {
-				// Update existing entry.
-				schedulingCtx.Status.ResourceClaims[i].UnsuitableNodes = delayed.UnsuitableNodes
-				modified = true
-			}
-		}
-		if modified {
-			logger.V(2).Info("Updating pod scheduling with modified unsuitable nodes", "podSchedulingCtx", schedulingCtx)
-			if _, err := ctrl.kubeClient.ResourceV1alpha2().PodSchedulingContexts(schedulingCtx.Namespace).UpdateStatus(ctx, schedulingCtx, metav1.UpdateOptions{}); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
-
-	err = retry.RetryOnConflict(retry.DefaultRetry, retryFn)
-	if err != nil {
-		return fmt.Errorf("update unsuitable node status: %v", err)
+	if modified {
+		logger.V(6).Info("Updating pod scheduling with modified unsuitable nodes", "podSchedulingCtx", schedulingCtx)
+		if _, err := ctrl.kubeClient.ResourceV1alpha2().PodSchedulingContexts(schedulingCtx.Namespace).UpdateStatus(ctx, schedulingCtx, metav1.UpdateOptions{}); err != nil {
+			return fmt.Errorf("update unsuitable node status: %v", err)
+		}
 	}
 
 	// We must keep the object in our queue and keep updating the
