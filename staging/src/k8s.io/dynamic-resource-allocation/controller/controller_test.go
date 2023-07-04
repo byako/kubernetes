@@ -533,21 +533,19 @@ func (m mockDriver) GetClaimParameters(ctx context.Context, claim *resourcev1alp
 	return result, nil
 }
 
-func (m mockDriver) Allocate(ctx context.Context, claimAllocations []*ClaimAllocation, selectedNode string) ([]*resourcev1alpha2.AllocationResult, error) {
-	m.t.Logf("Allocate(%+v)", claimAllocations)
-	results := []*resourcev1alpha2.AllocationResult{}
-	for _, claimAllocation := range claimAllocations {
+func (m mockDriver) Allocate(ctx context.Context, claims []*ClaimAllocation, selectedNode string) {
+	m.t.Logf("Allocate(number of claims %d)", len(claims))
+	for _, claimAllocation := range claims {
+		m.t.Logf("Allocate(%s)", claimAllocation.Claim.Name)
 		allocate, ok := m.allocate[claimAllocation.Claim.Name]
 		if !ok {
-			m.t.Fatal("unexpected Allocate call")
+			m.t.Fatalf("unexpected Allocate call for claim %s", claimAllocation.Claim.Name)
 		}
 		assert.Equal(m.t, allocate.selectedNode, selectedNode, "selected node")
-		if allocate.allocErr != nil {
-			return nil, allocate.allocErr
-		}
-		results = append(results, allocate.allocResult)
+		claimAllocation.Error = allocate.allocErr
+		claimAllocation.Allocation = allocate.allocResult
 	}
-	return results, nil
+	return
 }
 
 func (m mockDriver) Deallocate(ctx context.Context, claim *resourcev1alpha2.ResourceClaim) error {

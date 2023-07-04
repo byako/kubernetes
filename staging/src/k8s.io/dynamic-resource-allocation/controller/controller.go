@@ -372,7 +372,7 @@ func (ctrl *controller) syncKey(ctx context.Context, key string) (obj runtime.Ob
 	case claimKeyPrefix:
 		claim, err := ctrl.getCachedClaim(ctx, object)
 		if claim == nil || err != nil {
-			return nil, fmt.Errorf("cached claim not found, err: %v", err)
+			return nil, err
 		}
 		obj, finalErr = claim, ctrl.syncClaim(ctx, claim)
 	case schedulingCtxKeyPrefix:
@@ -514,7 +514,11 @@ func (ctrl *controller) syncClaim(ctx context.Context, claim *resourcev1alpha2.R
 
 	ctrl.allocateClaims(ctx, claimAllocations, "", nil)
 
-	return claimAllocations[0].Error
+	if claimAllocations[0].Error != nil {
+		return fmt.Errorf("allocate: %v", claimAllocations[0].Error)
+	}
+
+	return nil
 }
 
 func (ctrl *controller) getParameters(ctx context.Context, claim *resourcev1alpha2.ResourceClaim, class *resourcev1alpha2.ResourceClass) (claimParameters, classParameters interface{}, err error) {
