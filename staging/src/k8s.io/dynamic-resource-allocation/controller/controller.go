@@ -585,7 +585,7 @@ func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocati
 	logger.V(5).Info("Allocating")
 	ctrl.driver.Allocate(ctx, claimsWithFinalizers, selectedNode)
 
-	// Update successfully allocated claims' status with allocation info
+	// Update successfully allocated claims' status with allocation info.
 	for _, claimAllocation := range claimsWithFinalizers {
 		if claimAllocation.Error != nil {
 			logger.Error(claimAllocation.Error, "allocating claim", "claim", claimAllocation.Claim.Name)
