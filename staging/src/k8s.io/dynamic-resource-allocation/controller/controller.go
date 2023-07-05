@@ -580,7 +580,7 @@ func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocati
 		claimsWithFinalizers = append(claimsWithFinalizers, claimAllocation)
 	}
 
-	// Beyong here we only operate with claimsWithFinalizers
+	// Beyond here we only operate with claimsWithFinalizers because those are ready for allocation.
 
 	logger.V(5).Info("Allocating")
 	ctrl.driver.Allocate(ctx, claimsWithFinalizers, selectedNode)
