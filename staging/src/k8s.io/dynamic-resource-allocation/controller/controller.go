@@ -597,7 +597,7 @@ func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocati
 			// do now update this claim with allocation, it might succeed next time
 			continue
 		}
-		logger.V(5).Info("successfully allocated", "claim", claimAllocation.Claim.Name)
+		logger.V(5).Info("successfully allocated", "claim", klog.KObj(claimAllocation.Claim))
 		claim := claimAllocation.Claim.DeepCopy()
 		claim.Status.Allocation = claimAllocation.Allocation
 		claim.Status.DriverName = ctrl.name
