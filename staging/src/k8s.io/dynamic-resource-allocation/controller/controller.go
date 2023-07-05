@@ -535,7 +535,7 @@ func (ctrl *controller) getParameters(ctx context.Context, claim *resourcev1alph
 	return
 }
 
-// allocateClaims filters list of claims, keeps those needeing allocation and asks driver to do the allocations.
+// allocateClaims filters list of claims, keeps those needing allocation and asks driver to do the allocations.
 // Driver is supposed to write the AllocationResult and Error field into argument claims slice.
 func (ctrl *controller) allocateClaims(ctx context.Context, claims claimAllocations, selectedNode string, selectedUser *resourcev1alpha2.ResourceClaimConsumerReference) {
 	logger := klog.FromContext(ctx)
