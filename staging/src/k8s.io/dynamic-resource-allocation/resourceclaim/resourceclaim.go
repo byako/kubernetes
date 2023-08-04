@@ -30,6 +30,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	resourcev1alpha2 "k8s.io/api/resource/v1alpha2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
 )
 
 var (
@@ -67,11 +68,16 @@ func Name(pod *v1.Pod, podClaim *v1.PodResourceClaim) (name *string, mustCheckOw
 	case podClaim.Source.ResourceClaimName != nil:
 		return podClaim.Source.ResourceClaimName, false, nil
 	case podClaim.Source.ResourceClaimTemplateName != nil:
+		klog.V(3).Infof("Length of pod.Status.ResourceClaimStatuses: %d", len(pod.Status.ResourceClaimStatuses))
+		klog.V(3).Infof("Looking for claim %s status", podClaim.Name)
 		for _, status := range pod.Status.ResourceClaimStatuses {
+			klog.V(3).Infof("pod/Status.ResourceClaimStatus: %+v", status)
 			if status.Name == podClaim.Name {
+				klog.V(3).Infof("Found claim %s status", podClaim.Name)
 				return status.ResourceClaimName, true, nil
 			}
 		}
+		klog.V(3).Infof("Could not find claim %s status", podClaim.Name)
 		return nil, false, fmt.Errorf(`pod "%s/%s": %w`, pod.Namespace, pod.Name, ErrClaimNotFound)
 	default:
 		return nil, false, fmt.Errorf(`pod "%s/%s", spec.resourceClaim %q: %w`, pod.Namespace, pod.Name, podClaim.Name, ErrAPIUnsupported)
