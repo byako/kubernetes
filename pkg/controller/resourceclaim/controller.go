@@ -488,6 +488,7 @@ func (ec *Controller) syncPod(ctx context.Context, namespace, name string) error
 	}
 
 	if newPodClaims != nil {
+		logger.V(5).Info("Patching Pod %v with %d newly generated claim statuses", name, len(newPodClaims))
 		// Patch the pod status with the new information about
 		// generated ResourceClaims.
 		statuses := make([]*corev1apply.PodResourceClaimStatusApplyConfiguration, 0, len(newPodClaims))
@@ -498,6 +499,8 @@ func (ec *Controller) syncPod(ctx context.Context, namespace, name string) error
 		if _, err := ec.kubeClient.CoreV1().Pods(namespace).ApplyStatus(ctx, podApply, metav1.ApplyOptions{FieldManager: fieldManager, Force: true}); err != nil {
 			return fmt.Errorf("update pod %s/%s ResourceClaimStatuses: %v", namespace, name, err)
 		}
+	} else {
+		logger.V(5).Info("Not patching Pod %v with newly generated claim statuses")
 	}
 
 	if pod.Spec.NodeName == "" {
